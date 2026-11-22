@@ -1,0 +1,22 @@
+name: sleep-logger
+
+# All settings come from .env (copy .env.example). Run from this directory.
+services:
+  logger:
+    image: python:3.12-slim
+    container_name: sleep-logger
+    restart: unless-stopped
+    network_mode: host
+    command: ["python", "-u", "/app/sleep_logger.py"]
+    env_file:
+      - .env
+    volumes:
+      - ./sleep_logger.py:/app/sleep_logger.py:ro
+      - ./data:/data
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 128m

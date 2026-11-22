@@ -1,0 +1,103 @@
+# computer-vision-crib-watch
+
+Log your baby's sleep to Huckleberry from a crib camera, using a vision model that runs on your own hardware.
+
+Every two minutes the script takes a snapshot of the crib camera through Home Assistant and asks a local [Ollama](https://ollama.com) vision model one question: is the crib empty, or is the baby asleep or awake? It then starts and stops the Huckleberry sleep timer through the [Huckleberry integration for Home Assistant](https://github.com/Woyken/huckleberry-homeassistant). Camera frames stay on your network.
+
+> [!WARNING]
+> This is a sleep log, not a baby monitor. It can be wrong and it can go offline. Do not rely on it for your child's safety.
+
+## Features
+
+- Works with any camera Home Assistant can take a snapshot from, including night vision
+- Sleeps are backdated to the first frame the baby was seen asleep
+- Short stirs do not split a sleep, and very short sleeps are thrown away
+- Leaves the timer alone if someone already started one by hand
+- Dry-run mode records what it would log without touching Huckleberry
+- One Python file, standard library only, no image to build
+
+## Requirements
+
+- Home Assistant with a camera entity pointed at the crib
+- The Huckleberry integration set up for your child
+- An Ollama server with a vision-capable model. It was built and tested with `gemma4:12b-it-qat` on a 16 GB GPU.
+- Docker, or Python 3.10 or newer
+
+## Getting started
+
+1. Clone the repository and create your settings file.
+
+   ```sh
+   git clone https://github.com/rohanpandula/computer-vision-crib-watch.git
+   cd computer-vision-crib-watch
+   cp .env.example .env
+   chmod 600 .env
+   ```
+
+2. Fill in `.env`.
+
+   | Setting | What it is |
+   |---|---|
+   | `HA_URL` | Address of your Home Assistant |
+   | `HA_TOKEN` | A long-lived access token, created under your Home Assistant profile, Security tab |
+   | `CAMERA` | The crib camera entity, for example `camera.crib` |
+   | `HUCKLEBERRY_DEVICE_ID` | The child's device id (see below) |
+   | `SLEEP_SENSOR` | The child's sleep sensor from the Huckleberry integration |
+   | `OLLAMA_URL`, `MODEL` | Your Ollama server and vision model |
+   | `DRY_RUN` | `1` records only, `0` writes to Huckleberry |
+
+   To find the device id, open Developer tools, then Template, in Home Assistant and enter:
+
+   ```jinja
+   {{ device_id('sensor.baby_sleep') }}
+   ```
+
+3. Start it and watch the first few reads.
+
+   ```sh
+   docker compose up -d
+   docker logs -f sleep-logger
+   ```
+
+> [!TIP]
+> Leave `DRY_RUN=1` for the first nap or night. Compare `data/events.jsonl` with what really happened, then set `DRY_RUN=0` and run `docker compose up -d` again.
+
+## How it decides
+
+| Rule | Default | Setting |
+|---|---|---|
+| Asleep reads in a row before a sleep starts | 3 | `ASLEEP_CHECKS` |
+| Time awake or out of the crib before a sleep ends | 10 minutes | `WAKE_MIN` |
+| Sleeps shorter than this are cancelled instead of saved | 10 minutes | `MIN_SLEEP_MIN` |
+| Camera or model unreachable for this long ends the sleep | 60 minutes | `OFFLINE_END_MIN` |
+| Time between checks | 120 seconds | `INTERVAL_S` |
+
+A sleep ends at the first frame where the baby was awake or gone, not at the moment the rule fires. If the camera drops out, the sleep ends at the last frame where the baby was seen asleep.
+
+When the model is unsure, or a snapshot fails, that check is ignored. It neither starts nor ends anything.
+
+## Reviewing its calls
+
+Everything it writes goes to the `data` folder:
+
+- `events.jsonl` has one line per sleep it started, completed or cancelled
+- `frames/` keeps the snapshot from each change of state for three days, so you can look at the frame behind a wrong call
+- `state.json` lets a sleep in progress survive a restart
+
+> [!NOTE]
+> The saved frames are pictures of your child. They never leave the machine running the script, but treat that folder accordingly.
+
+## Tests
+
+The sleep rules are a small state machine with a built-in check:
+
+```sh
+python3 sleep_logger.py --selftest
+```
+
+## Limitations
+
+- Tested so far on an overhead night-vision view. Daytime views, awake frames and empty-crib frames have had much less testing.
+- It only sees the crib. Naps in a car seat, stroller or anyone's arms still need logging by hand.
+- A baby lying still with their face hidden will probably be read as asleep.
+- While it runs, the vision model stays loaded on the Ollama server and holds its memory.
