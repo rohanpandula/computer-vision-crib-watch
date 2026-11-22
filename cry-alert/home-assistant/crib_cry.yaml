@@ -1,0 +1,91 @@
+# Home Assistant package: a cry sensor fed by the cry-alert container, and a
+# phone notification when it hears crying.
+#
+# Copy to /config/packages/crib_cry.yaml. Packages need this in
+# configuration.yaml:
+#
+#   homeassistant:
+#     packages: !include_dir_named packages
+#
+# Change notify.mobile_app_your_phone and camera.crib to your own entities.
+#
+# The "Crib cry critical alert" switch this file creates is off by default.
+# Turn it on to make the cry notification sound through silent mode and Focus
+# on an iPhone.
+
+mqtt:
+  binary_sensor:
+    - name: Crib Cry
+      unique_id: crib_watch_cry
+      state_topic: crib_watch/crib/audio/crying
+      payload_on: "ON"
+      payload_off: "OFF"
+      availability_topic: crib_watch/available
+      payload_available: online
+      payload_not_available: offline
+      device_class: sound
+  sensor:
+    - name: Crib Audio Level
+      unique_id: crib_watch_audio_level
+      state_topic: crib_watch/crib/audio/dBFS
+      value_template: "{{ value | float(0) | round(1) }}"
+      unit_of_measurement: dBFS
+      availability_topic: crib_watch/available
+      payload_available: online
+      payload_not_available: offline
+      expire_after: 120
+
+input_boolean:
+  crib_cry_critical_alert:
+    name: Crib cry critical alert
+    icon: mdi:bell-alert
+
+automation:
+  - id: crib_watch_cry_push
+    alias: "Crib watch: cry push"
+    description: >-
+      Phone notification when the crib camera hears crying, at most once every
+      two minutes.
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.crib_cry
+        to: "on"
+    actions:
+      - action: notify.mobile_app_your_phone
+        data:
+          title: Baby is crying
+          message: Heard on the crib camera.
+          data:
+            tag: crib-watch-cry
+            # Shows the live view when you expand the notification.
+            entity_id: camera.crib
+            # iPhone only. critical: 1 sounds through silent mode and Focus;
+            # 0 is an ordinary notification.
+            push:
+              sound:
+                name: default
+                critical: "{{ 1 if is_state('input_boolean.crib_cry_critical_alert', 'on') else 0 }}"
+                volume: 1.0
+      # Cooldown: with mode single, new cries are ignored until this ends.
+      - delay: "00:02:00"
+    mode: single
+    max_exceeded: silent
+
+  # Kept separate so the cry cooldown above can never hold this one back.
+  - id: crib_watch_cry_offline
+    alias: "Crib watch: cry alerts offline"
+    description: >-
+      Phone notification if the audio feed has been gone for five minutes.
+    triggers:
+      - trigger: state
+        entity_id: sensor.crib_audio_level
+        to: unavailable
+        for: "00:05:00"
+    actions:
+      - action: notify.mobile_app_your_phone
+        data:
+          title: Cry alerts offline
+          message: No audio from the crib camera for 5 minutes.
+          data:
+            tag: crib-watch-cry-offline
+    mode: single

@@ -15,6 +15,7 @@ Every two minutes the script takes a snapshot of the crib camera through Home As
 - Leaves the timer alone if someone already started one by hand
 - Dry-run mode records what it would log without touching Huckleberry
 - One Python file, standard library only, no image to build
+- Optional cry alerts for cameras that have a microphone but no cry detection of their own
 
 ## Requirements
 
@@ -87,6 +88,46 @@ Everything it writes goes to the `data` folder:
 > [!NOTE]
 > The saved frames are pictures of your child. They never leave the machine running the script, but treat that folder accordingly.
 
+## Cry alerts (optional)
+
+Some cameras have a microphone but no baby-cry detection. The `cry-alert` folder adds it: a [Frigate](https://frigate.video) container listens to the camera's audio, and Home Assistant sends a notification to your phone when it hears crying.
+
+This part is separate from the sleep logger. It needs no vision model and no GPU, and either one works without the other. Frigate is used only as a sound classifier here, with video detection and recording turned off.
+
+You need an MQTT broker connected to Home Assistant, and an RTSP stream from the camera that carries audio.
+
+1. Create the settings file and fill in the MQTT login and the camera's RTSP address.
+
+   ```sh
+   cd cry-alert
+   cp .env.example .env
+   chmod 600 .env
+   ```
+
+2. If your MQTT broker is not at `homeassistant.local`, change `mqtt.host` in `config/config.yml`. Then start the container.
+
+   ```sh
+   docker compose up -d
+   ```
+
+3. Copy `home-assistant/crib_cry.yaml` into your Home Assistant `packages` folder, change the phone and camera entities named at the top of the file, and restart Home Assistant.
+
+To check the audio is arriving, look at the `Crib Audio Level` sensor in Home Assistant. A quiet room reads around -60 dBFS and the number rises with noise.
+
+Two settings in `config/config.yml` control how easily it alerts:
+
+| Setting | Default here | What it does |
+|---|---|---|
+| `min_volume` | 300 | How loud the room must be before the classifier runs. Lower is more sensitive. |
+| `threshold` | 0.7 | How confident the classifier must be that the sound is crying. Lower gives more alerts and more false ones. |
+
+You get at most one cry notification every two minutes, and a separate notification if the audio feed has been gone for five minutes.
+
+By default the cry notification is an ordinary one, so it follows your phone's silent and Focus settings. The package also adds a switch to Home Assistant called `Crib cry critical alert`. Turn it on and the notification becomes an iOS critical alert, which sounds even when the phone is silenced.
+
+> [!NOTE]
+> Critical alerts are an iPhone feature and must be allowed for the Home Assistant app in the iOS notification settings. On Android the switch has no effect.
+
 ## Tests
 
 The sleep rules are a small state machine with a built-in check:
@@ -101,3 +142,5 @@ python3 sleep_logger.py --selftest
 - It only sees the crib. Naps in a car seat, stroller or anyone's arms still need logging by hand.
 - A baby lying still with their face hidden will probably be read as asleep.
 - While it runs, the vision model stays loaded on the Ollama server and holds its memory.
+- Cry alerts have been checked with a live microphone feed and a simulated detection, but not yet against a real cry. Expect to adjust `min_volume` and `threshold` for your room.
+- The critical alert switch has not been tried on a phone yet.
