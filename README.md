@@ -49,6 +49,7 @@ Every two minutes the script takes a snapshot of the crib camera through Home As
    | `OLLAMA_URL`, `MODEL` | Your Ollama server and vision model |
    | `DRY_RUN` | `1` records only, `0` writes to Huckleberry |
    | `NOTIFY_SERVICE` | Optional. A notify service for problem alerts, for example `notify.mobile_app_my_phone` |
+   | `CRY_SENSOR` | Optional. A cry sensor, for example `binary_sensor.crib_cry` from the cry alerts below |
    | `MOTION_SENSOR` | Optional. The camera's motion sensor, for example `binary_sensor.crib_motion` |
 
    To find the device id, open Developer tools, then Template, in Home Assistant and enter:
@@ -82,6 +83,8 @@ A sleep ends at the first frame where the baby was awake or gone, not at the mom
 If you set `MOTION_SENSOR`, new motion during a sleep triggers a check right away instead of waiting for the next one. Motion never ends a sleep by itself. It only makes the script look sooner, and the vision model still decides.
 
 If a call to Huckleberry fails, it is kept and tried again on every check until it goes through, including across restarts. With `NOTIFY_SERVICE` set you get a push after 15 failed tries in a row (`RETRY_ALERT_TRIES`), and another when the camera or the model has been unreachable for 15 minutes (`BLIND_ALERT_MIN`). The pushes go through Home Assistant, so they cannot tell you that Home Assistant itself is down.
+
+If you set `CRY_SENSOR`, a cry during a sleep also triggers a check right away. If the baby is then seen awake or gone within 10 minutes, the sleep ends at the time of the cry, since that is when the baby really woke. A cry the baby settles from changes nothing.
 
 When the model is unsure, or a snapshot fails, that check is ignored. It neither starts nor ends anything.
 
@@ -149,6 +152,7 @@ python3 sleep_logger.py --selftest
 - Tested so far on an overhead night-vision view. Daytime views, awake frames and empty-crib frames have had much less testing.
 - It only sees the crib. Naps in a car seat, stroller or anyone's arms still need logging by hand.
 - A baby lying still with their face hidden will probably be read as asleep.
+- An empty sleep sack left in the crib was once read as a sleeping baby. The prompt now tells the model to look for a head or face, which fixed the saved example, but other objects may still fool it.
 - While it runs, the vision model stays loaded on the Ollama server and holds its memory.
 - Cry alerts have been checked with a live microphone feed and a simulated detection, but not yet against a real cry. Expect to adjust `min_volume` and `threshold` for your room.
 - The critical alert switch has not been tried on a phone yet.

@@ -18,6 +18,7 @@ CAMERA = os.environ.get("CAMERA", "")                      # e.g. camera.crib
 DEVICE_ID = os.environ.get("HUCKLEBERRY_DEVICE_ID", "")    # the child's device in Home Assistant
 SLEEP_SENSOR = os.environ.get("SLEEP_SENSOR", "")          # e.g. sensor.<child>_sleep
 MOTION = os.environ.get("MOTION_SENSOR", "")                # optional, e.g. binary_sensor.crib_motion
+CRY = os.environ.get("CRY_SENSOR", "")                      # optional, e.g. binary_sensor.crib_cry
 NOTIFY = os.environ.get("NOTIFY_SERVICE", "")               # optional, e.g. notify.mobile_app_my_phone
 DRY_RUN = os.environ.get("DRY_RUN", "1") != "0"
 DATA = pathlib.Path(os.environ.get("DATA_DIR", "/data"))
@@ -36,7 +37,8 @@ FRAME_KEEP_DAYS = 3
 
 PROMPT = ("Overhead view of a baby crib (may be night vision). Report whether a baby is in the "
           "crib and whether the baby is asleep (lying still, eyes closed) or awake (eyes open, "
-          "sitting, standing, crying).")
+          "sitting, standing, crying). A baby counts as in the crib only if you can see its head or "
+          "face. An empty sleep sack, swaddle, blanket, clothing or toy lying in the crib is not a baby.")
 SCHEMA = {"type": "object", "required": ["baby_in_crib", "state", "eyes", "adult_present"], "properties": {
     "baby_in_crib": {"type": "boolean"},
     "state": {"type": "string", "enum": ["empty", "asleep", "awake", "unsure"]},
@@ -50,7 +52,7 @@ class Tracker:
     label: "asleep" | "awake" | "empty" | None (unsure / camera or model unavailable).
     events: ("start", start_ts) | ("complete", start_ts, end_ts) | ("cancel", start_ts, end_ts)
     """
-    FIELDS = ("run", "run_start", "start", "last_asleep", "wake_since", "owned", "pending", "tries")
+    FIELDS = ("run", "run_start", "start", "last_asleep", "wake_since", "owned", "pending", "tries", "cry_at")
 
     def __init__(self, saved=None):
         self.run, self.run_start = 0, None      # consecutive asleep frames while idle
@@ -58,12 +60,18 @@ class Tracker:
         self.last_asleep = self.wake_since = None
         self.owned = False                      # did we start the Huckleberry timer?
         self.pending, self.tries = [], 0        # events not yet delivered to Huckleberry
+        self.cry_at = None                      # first cry of the current bout, while sleeping
         for k, v in (saved or {}).items():
             if k in self.FIELDS:
                 setattr(self, k, v)
 
     def dump(self):
         return {k: getattr(self, k) for k in self.FIELDS}
+
+    def cry(self, t):
+        """A cry was heard at t. Kept as the likely wake time if the camera then agrees."""
+        if self.start is not None and t > self.start and (self.cry_at is None or t - self.cry_at > WAKE_MIN * 60):
+            self.cry_at = t
 
     def step(self, label, t):
         if self.start is None:
@@ -88,13 +96,15 @@ class Tracker:
             self.last_asleep, self.wake_since = t, None
         elif label is not None:
             if self.wake_since is None:
-                self.wake_since = t
+                # woke crying a few minutes ago: the cry, not this frame, is when the sleep ended
+                recent = self.cry_at is not None and 0 <= t - self.cry_at <= WAKE_MIN * 60
+                self.wake_since = self.cry_at if recent else t
             # only a frame that still shows awake/empty confirms the wake-up; blind time does not
             if t - self.wake_since >= WAKE_MIN * 60:
                 end = self.wake_since
         if end is None:
             return []
-        start, self.start, self.wake_since = self.start, None, None
+        start, self.start, self.wake_since, self.cry_at = self.start, None, None, None
         kind = "complete" if end - start >= MIN_SLEEP_MIN * 60 else "cancel"
         return [(kind, start, end)]
 
@@ -226,28 +236,43 @@ def prune_frames():
             p.unlink()
 
 
-motion_was_on = None    # unknown until the first valid reading, so a restart is not mistaken for new motion
+seen = {}   # sensor -> (state, last_changed) at the last poll
+
+
+def fired(sensor):
+    """Time of new activity on a binary sensor since the last poll, else None. Fires when a
+    sensor that was off has changed: it is now on, or it blipped on and off between polls.
+    The first reading after a (re)start is only a baseline, and "unavailable" is not a reading."""
+    s = json.loads(ha("/api/states/" + sensor))
+    if s["state"] not in ("on", "off"):
+        return None
+    old, seen[sensor] = seen.get(sensor), (s["state"], s["last_changed"])
+    if old is None or old[0] != "off" or old[1] == s["last_changed"]:
+        return None
+    return datetime.fromisoformat(s["last_changed"]).timestamp()
 
 
 def wait(tr, t0):
-    """Sleep until the next check. During a sleep, new motion cuts the wait short so the
-    wake time is caught to within seconds. Motion already under way does not re-trigger."""
-    global motion_was_on
+    """Sleep until the next check. During a sleep, new motion or a cry cuts the wait short so
+    the wake time is caught to within seconds. Activity already under way does not re-trigger."""
     end = max(time.time() + 5, t0 + INTERVAL)
     while time.time() < end:
         time.sleep(max(0, min(10, end - time.time())))
-        if not MOTION or tr.start is None:
+        if tr.start is None:
+            seen.clear()
             continue
-        try:
-            st = json.loads(ha("/api/states/" + MOTION))["state"]
-        except Exception:
-            continue
-        if st not in ("on", "off"):     # unavailable / unknown is not a reading
-            continue
-        on = st == "on"
-        fresh, motion_was_on = on and motion_was_on is False, on
-        if fresh:
-            log(msg="motion, looking now")
+        why = []
+        for name, sensor in (("cry", CRY), ("motion", MOTION)):
+            try:
+                at = fired(sensor) if sensor else None
+            except Exception:
+                continue
+            if at is not None:
+                why.append(name)
+                if name == "cry":
+                    tr.cry(at)
+        if why:
+            log(msg=" and ".join(why) + ", looking now")
             return
 
 
@@ -293,7 +318,7 @@ def main():
 
 
 def selftest():
-    global ha, MOTION, DRY_RUN, record, save
+    global ha, MOTION, CRY, DRY_RUN, record, save
     globals().update(INTERVAL=120, ASLEEP_CHECKS=3, WAKE_MIN=10, MIN_SLEEP_MIN=10, OFFLINE_END_MIN=60)
     m = 60
     def run(seq, step=2 * m):
@@ -327,6 +352,15 @@ def selftest():
     # an asleep frame after a 2-hour gap closes the old sleep at its last asleep frame
     tr = Tracker(); [tr.step(A, i * 2 * m) for i in range(10)]
     assert tr.step(A, 18 * m + 7200) == [("complete", 0, 18 * m)]
+    # woke crying: the sleep ends at the cry, even though frames kept reading asleep for a bit
+    tr = Tracker(); [tr.step(A, i * 2 * m) for i in range(10)]
+    tr.cry(19 * m); tr.cry(19.5 * m)
+    assert tr.step(A, 20 * m) == [] and [tr.step(E, k * m) for k in (22, 24, 26, 28)] == [[]] * 4
+    assert tr.step(E, 30 * m) == [("complete", 0, 19 * m)] and tr.cry_at is None
+    # a cry she settled from is forgotten: a later wake-up ends at the first awake frame
+    tr = Tracker(); [tr.step(A, i * 2 * m) for i in range(10)]
+    tr.cry(5 * m)
+    assert [tr.step(W, k * m) for k in (20, 26)] == [[], []] and tr.step(W, 30 * m) == [("complete", 0, 20 * m)]
     # a malformed model reply is "unsure", never "empty"
     for reply, want in (({}, None), ({"baby_in_crib": False}, "empty"), ({"baby_in_crib": True, "state": "awake"}, "awake")):
         _real, globals()["_req"] = _req, lambda *a, **k: json.dumps({"message": {"content": json.dumps(reply)}})
@@ -363,19 +397,28 @@ def selftest():
     fake["state"] = "unavailable"; tr.pending = [["start", 9000.0]]
     flush(tr); assert tr.tries == 1 and len(tr.pending) == 1
 
-    # new motion during a sleep cuts the wait short; motion that is still going does not
-    clock, feed = [0.0], ["off", "on"]
+    # sensor triggers, on a fake clock
+    clock, feeds = [0.0], {}
     time.time, time.sleep = (lambda: clock[0]), (lambda s: clock.__setitem__(0, clock[0] + s))
-    feed += []; globals()["motion_was_on"] = None
-    MOTION, ha = "x", lambda path, body=None: json.dumps({"state": feed.pop(0) if feed else "on"})
-    tr = Tracker(); tr.start = 0
+    def ha(path, body=None):    # each sensor replays its feed of (state, changed-at seconds), then holds the last
+        f = feeds[path.rsplit("/", 1)[1]]
+        st, at = f.pop(0) if len(f) > 1 else f[0]
+        return json.dumps({"state": st, "last_changed": iso(at)})
+    MOTION, CRY = "m", ""
+    # new motion during a sleep cuts the wait short; motion that is still going does not
+    tr = Tracker(); tr.start = 0; seen.clear(); feeds["m"] = [("off", 0), ("on", 15)]
     wait(tr, 0); assert clock[0] == 20, clock
     wait(tr, 20); assert clock[0] == 20 + INTERVAL, clock
-    tr.start = None; feed[:] = ["off", "on"]          # not sleeping: motion is ignored
-    wait(tr, clock[0]); assert clock[0] == 20 + 2 * INTERVAL, clock
-    # after a restart, motion that is already on (or unavailable in between) is not a new edge
-    globals()["motion_was_on"] = None; tr.start = 0; feed[:] = ["on", "unavailable", "on"]
+    # not sleeping: sensors are ignored
+    tr.start = None; feeds["m"] = [("off", 200), ("on", 210)]
     t = clock[0]; wait(tr, t); assert clock[0] == t + INTERVAL, clock
+    # after a restart, motion already on (or unavailable in between) is not a new edge
+    tr.start = 0; seen.clear(); feeds["m"] = [("on", 300), ("unavailable", 310), ("on", 320)]
+    t = clock[0]; wait(tr, t); assert clock[0] == t + INTERVAL, clock
+    # a cry that came and went between two polls still counts, and is remembered as the cry time
+    MOTION, CRY = "", "c"
+    seen.clear(); t = clock[0]; feeds["c"] = [("off", 0), ("off", t + 14)]
+    wait(tr, t); assert clock[0] == t + 20 and tr.cry_at == t + 14, (clock, tr.cry_at)
     print("selftest ok")
 
 
