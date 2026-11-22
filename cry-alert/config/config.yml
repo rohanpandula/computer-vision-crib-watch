@@ -1,0 +1,59 @@
+version: 0.18-0
+
+# Frigate used only as a sound classifier for the crib camera.
+# Video detection, recording and snapshots are off. It runs on the CPU.
+
+tls:
+  enabled: false
+
+mqtt:
+  # The MQTT broker Home Assistant uses. Change this if yours is elsewhere.
+  host: homeassistant.local
+  user: "{FRIGATE_MQTT_USER}"
+  password: "{FRIGATE_MQTT_PASSWORD}"
+  client_id: crib_watch
+  topic_prefix: crib_watch
+
+go2rtc:
+  streams:
+    crib:
+      - "{FRIGATE_CAMERA_URL}"
+
+detect:
+  enabled: false
+
+record:
+  enabled: false
+
+snapshots:
+  enabled: false
+
+# min_volume: how loud the room must be before the classifier runs.
+#   200 is sensitive, 500 is Frigate's default, 1000 only reacts to loud sound.
+# threshold: how confident the classifier must be. Lower means more alerts
+#   and more false ones.
+# max_not_heard: seconds of quiet before the cry sensor turns off again.
+audio:
+  enabled: true
+  min_volume: 300
+  max_not_heard: 30
+  listen:
+    - crying
+  filters:
+    crying:
+      threshold: 0.7
+
+cameras:
+  crib:
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/crib
+          input_args: preset-rtsp-restream
+          roles:
+            - detect
+            - audio
+    # Detection is off, but Frigate still wants a size. Any small value works.
+    detect:
+      width: 640
+      height: 360
+      fps: 2

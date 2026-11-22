@@ -1,0 +1,18 @@
+name: cry-alert
+
+# Settings come from .env (copy .env.example). Run from this directory.
+services:
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:0.18.0
+    container_name: cry-alert
+    restart: unless-stopped
+    stop_grace_period: 30s
+    shm_size: 128mb
+    env_file:
+      - .env
+    volumes:
+      - ./config:/config
+      - ./media:/media/frigate
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "8971:8971"

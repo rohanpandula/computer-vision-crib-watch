@@ -1,3 +1,6 @@
 .env
 data/
 __pycache__/
+cry-alert/config/*
+!cry-alert/config/config.yml
+cry-alert/media/
