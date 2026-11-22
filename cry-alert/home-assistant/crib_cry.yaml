@@ -8,6 +8,10 @@
 #     packages: !include_dir_named packages
 #
 # Change notify.mobile_app_your_phone and camera.crib to your own entities.
+#
+# The "Crib cry critical alert" switch this file creates is off by default.
+# Turn it on to make the cry notification sound through silent mode and Focus
+# on an iPhone.
 
 mqtt:
   binary_sensor:
@@ -31,6 +35,11 @@ mqtt:
       payload_not_available: offline
       expire_after: 120
 
+input_boolean:
+  crib_cry_critical_alert:
+    name: Crib cry critical alert
+    icon: mdi:bell-alert
+
 automation:
   - id: crib_watch_cry_push
     alias: "Crib watch: cry push"
@@ -50,6 +59,13 @@ automation:
             tag: crib-watch-cry
             # Shows the live view when you expand the notification.
             entity_id: camera.crib
+            # iPhone only. critical: 1 sounds through silent mode and Focus;
+            # 0 is an ordinary notification.
+            push:
+              sound:
+                name: default
+                critical: "{{ 1 if is_state('input_boolean.crib_cry_critical_alert', 'on') else 0 }}"
+                volume: 1.0
       # Cooldown: with mode single, new cries are ignored until this ends.
       - delay: "00:02:00"
     mode: single

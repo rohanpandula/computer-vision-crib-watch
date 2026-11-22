@@ -121,7 +121,12 @@ Two settings in `config/config.yml` control how easily it alerts:
 | `min_volume` | 300 | How loud the room must be before the classifier runs. Lower is more sensitive. |
 | `threshold` | 0.7 | How confident the classifier must be that the sound is crying. Lower gives more alerts and more false ones. |
 
-The notification is an ordinary one, so it follows your phone's silent and Focus settings. You get at most one every two minutes, and a separate notification if the audio feed has been gone for five minutes.
+You get at most one cry notification every two minutes, and a separate notification if the audio feed has been gone for five minutes.
+
+By default the cry notification is an ordinary one, so it follows your phone's silent and Focus settings. The package also adds a switch to Home Assistant called `Crib cry critical alert`. Turn it on and the notification becomes an iOS critical alert, which sounds even when the phone is silenced.
+
+> [!NOTE]
+> Critical alerts are an iPhone feature and must be allowed for the Home Assistant app in the iOS notification settings. On Android the switch has no effect.
 
 ## Tests
 
@@ -138,3 +143,4 @@ python3 sleep_logger.py --selftest
 - A baby lying still with their face hidden will probably be read as asleep.
 - While it runs, the vision model stays loaded on the Ollama server and holds its memory.
 - Cry alerts have been checked with a live microphone feed and a simulated detection, but not yet against a real cry. Expect to adjust `min_volume` and `threshold` for your room.
+- The critical alert switch has not been tried on a phone yet.
