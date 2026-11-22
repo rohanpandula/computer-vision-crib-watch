@@ -76,6 +76,8 @@ Every two minutes the script takes a snapshot of the crib camera through Home As
 |---|---|---|
 | Asleep reads in a row before a sleep starts | 3 | `ASLEEP_CHECKS` |
 | Time awake or out of the crib before a sleep ends | 10 minutes | `WAKE_MIN` |
+
+A shorter `WAKE_MIN` makes the timer stop sooner after the baby is up, but every short pickup then splits the sleep in two. It should not be shorter than the time between checks.
 | Sleeps shorter than this are cancelled instead of saved | 10 minutes | `MIN_SLEEP_MIN` |
 | Camera or model unreachable for this long ends the sleep | 60 minutes | `OFFLINE_END_MIN` |
 | Time between checks | 120 seconds | `INTERVAL_S` |

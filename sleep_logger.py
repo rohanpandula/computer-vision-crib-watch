@@ -34,6 +34,7 @@ OFFLINE_END_MIN = float(os.environ.get("OFFLINE_END_MIN", "60"))  # camera blind
 BLIND_ALERT_MIN = float(os.environ.get("BLIND_ALERT_MIN", "15"))  # camera/model failing this long sends a push
 RETRY_ALERT_TRIES = int(os.environ.get("RETRY_ALERT_TRIES", "15"))  # failed Huckleberry calls in a row before a push
 FRAME_KEEP_DAYS = 3
+RECENT = 600    # seconds: how long a cry stays relevant, and the longest gap inside one asleep streak
 
 PROMPT = ("Overhead view of a baby crib (may be night vision). Report whether a baby is in the "
           "crib and whether the baby is asleep (lying still, eyes closed) or awake (eyes open, "
@@ -70,14 +71,14 @@ class Tracker:
 
     def cry(self, t):
         """A cry was heard at t. Kept as the likely wake time if the camera then agrees."""
-        if self.start is not None and t > self.start and (self.cry_at is None or t - self.cry_at > WAKE_MIN * 60):
+        if self.start is not None and t > self.start and (self.cry_at is None or t - self.cry_at > RECENT):
             self.cry_at = t
 
     def step(self, label, t):
         if self.start is None:
             if label == "asleep":
                 # asleep frames separated by a long gap are not one streak
-                if self.run and (self.last_asleep is None or t - self.last_asleep > WAKE_MIN * 60):
+                if self.run and (self.last_asleep is None or t - self.last_asleep > RECENT):
                     self.run = 0
                 if self.run == 0:
                     self.run_start = t
@@ -97,7 +98,7 @@ class Tracker:
         elif label is not None:
             if self.wake_since is None:
                 # woke crying a few minutes ago: the cry, not this frame, is when the sleep ended
-                recent = self.cry_at is not None and 0 <= t - self.cry_at <= WAKE_MIN * 60
+                recent = self.cry_at is not None and 0 <= t - self.cry_at <= RECENT
                 self.wake_since = self.cry_at if recent else t
             # only a frame that still shows awake/empty confirms the wake-up; blind time does not
             if t - self.wake_since >= WAKE_MIN * 60:
@@ -403,6 +404,11 @@ def selftest():
     tr = Tracker(); [tr.step(A, i * 2 * m) for i in range(10)]
     tr.cry(5 * m)
     assert [tr.step(W, k * m) for k in (20, 26)] == [[], []] and tr.step(W, 30 * m) == [("complete", 0, 20 * m)]
+    # a short wake wait (WAKE_MIN=2) still lets a sleep start, and ends it on the second empty frame
+    globals()["WAKE_MIN"] = 2
+    assert run([A] * 6 + [E, E]) == [("start", 0), ("complete", 0, 12 * m)]
+    assert run([A] * 6 + [E, A, A]) == [("start", 0)]
+    globals()["WAKE_MIN"] = 10
     # a malformed model reply is "unsure", never "empty"
     for reply, want in (({}, None), ({"baby_in_crib": False}, "empty"), ({"baby_in_crib": True, "state": "awake"}, "awake")):
         _real, globals()["_req"] = _req, lambda *a, **k: json.dumps({"message": {"content": json.dumps(reply)}})
