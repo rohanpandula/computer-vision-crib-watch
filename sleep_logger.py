@@ -111,7 +111,7 @@ class Tracker:
 
 def _req(url, body=None, headers=None, timeout=30):
     data = None if body is None else json.dumps(body).encode()
-    h = {"Content-Type": "application/json", **(headers or {})}
+    h = {"Content-Type": "application/json", "User-Agent": "crib-watch/1.0", **(headers or {})}
     with urllib.request.urlopen(urllib.request.Request(url, data, h), timeout=timeout) as r:
         return r.read()
 
@@ -198,17 +198,50 @@ def act(tr, ev):
     record(event)
 
 
+def pushes(title, message):
+    """(name, url, body, headers) for every push platform that has its settings filled in.
+    Only the Home Assistant one has been used for real; the rest follow each service's
+    documented API but are untested."""
+    E, both = os.environ.get, f"{title}: {message}"
+    if NOTIFY:
+        yield ("home assistant", HA + "/api/services/" + NOTIFY.replace(".", "/"),
+               {"title": title, "message": message}, {"Authorization": "Bearer " + TOKEN})
+    if E("NTFY_TOPIC"):
+        auth = {"Authorization": "Bearer " + E("NTFY_TOKEN")} if E("NTFY_TOKEN") else {}
+        yield ("ntfy", E("NTFY_URL", "https://ntfy.sh"), {"topic": E("NTFY_TOPIC"), "title": title, "message": message}, auth)
+    if E("PUSHOVER_TOKEN") and E("PUSHOVER_USER"):
+        yield ("pushover", "https://api.pushover.net/1/messages.json",
+               {"token": E("PUSHOVER_TOKEN"), "user": E("PUSHOVER_USER"), "title": title, "message": message}, {})
+    if E("PUSHBULLET_TOKEN"):
+        yield ("pushbullet", "https://api.pushbullet.com/v2/pushes",
+               {"type": "note", "title": title, "body": message}, {"Access-Token": E("PUSHBULLET_TOKEN")})
+    if E("TELEGRAM_BOT_TOKEN") and E("TELEGRAM_CHAT_ID"):
+        yield ("telegram", f"https://api.telegram.org/bot{E('TELEGRAM_BOT_TOKEN')}/sendMessage",
+               {"chat_id": E("TELEGRAM_CHAT_ID"), "text": both}, {})
+    if E("GOTIFY_URL") and E("GOTIFY_TOKEN"):
+        yield ("gotify", E("GOTIFY_URL").rstrip("/") + "/message",
+               {"title": title, "message": message, "priority": 5}, {"X-Gotify-Key": E("GOTIFY_TOKEN")})
+    if E("DISCORD_WEBHOOK"):
+        yield ("discord", E("DISCORD_WEBHOOK"), {"content": both}, {})
+    if E("SLACK_WEBHOOK"):
+        yield ("slack", E("SLACK_WEBHOOK"), {"text": both}, {})
+    if E("WEBHOOK_URL"):
+        yield ("webhook", E("WEBHOOK_URL"), {"title": title, "message": message}, {})
+
+
 def notify(message):
-    """Returns False only if a push was wanted and could not be sent, so the caller can try again."""
-    log(notify=message, sent=bool(NOTIFY))
-    if not NOTIFY:
-        return True
-    try:
-        ha("/api/services/" + NOTIFY.replace(".", "/"), {"title": "Crib watch", "message": message})
-        return True
-    except Exception as e:  # the push goes through Home Assistant, so it cannot report HA itself being down
-        log(error=f"notify failed: {type(e).__name__}: {e}"[:300])
-        return False
+    """Send to every configured platform. Returns False only if pushes were wanted and none
+    got through, so the caller can try again. A push cannot report its own platform being down."""
+    sent, wanted = [], 0
+    for name, url, body, headers in pushes("Crib watch", message):
+        wanted += 1
+        try:
+            _req(url, body, headers, timeout=10)
+            sent.append(name)
+        except Exception as e:  # name only: some of these URLs contain the secret
+            log(error=f"{name} push failed: {type(e).__name__}"[:300])
+    log(notify=message, sent=sent)
+    return bool(sent) or not wanted
 
 
 def flush(tr):
@@ -221,7 +254,7 @@ def flush(tr):
         except Exception as e:
             tr.tries += 1
             log(error=f"huckleberry call failed: {type(e).__name__}: {e}"[:300], event=ev[0], tries=tr.tries)
-            if tr.tries == RETRY_ALERT_TRIES:
+            if tr.tries % RETRY_ALERT_TRIES == 0:
                 notify(f"Can't send a sleep {ev[0]} to Huckleberry ({tr.tries} tries so far). Still retrying.")
             return
         tr.pending.pop(0)
@@ -273,7 +306,8 @@ def wait(tr, t0):
                     tr.cry(at)
         if why:
             log(msg=" and ".join(why) + ", looking now")
-            return
+            return why
+    return []
 
 
 def main():
@@ -288,7 +322,7 @@ def main():
         log(error="state.json unreadable, starting fresh")
     tr = Tracker(saved)
     log(msg="sleep logger up", dry_run=DRY_RUN, camera=CAMERA, model=MODEL, state=tr.dump())
-    prev, blind_since, blind_told = "?", None, False
+    prev, blind_since, blind_told, why, last_frame = "?", None, False, [], 0
     while True:
         t0 = time.time()
         label, raw, jpeg, failed = None, None, None, False
@@ -303,10 +337,18 @@ def main():
         elif not failed and blind_told:
             blind_told = not notify("Can see the crib again.")
         log(label=label, raw=raw, secs=round(time.time() - t0, 1))
-        if jpeg and label != prev:  # keep the frame at every change, to review mistakes later
+        # Keep the frames worth a second look (see review.py): every change, every look a cry
+        # asked for, and awake reads and motion looks at most once every 10 minutes.
+        keep = label != prev or "cry" in why or ((label == "awake" or "motion" in why) and t0 - last_frame >= 600)
+        try:
+            prune_frames()
+        except OSError:
+            pass
+        if jpeg and keep:
             try:
-                prune_frames()
-                (DATA / "frames" / f"{time.strftime('%Y%m%d-%H%M%S')}_{label}.jpg").write_bytes(jpeg)
+                name = f"{time.strftime('%Y%m%d-%H%M%S')}_{label or 'unsure'}{'_' + why[0] if why else ''}.jpg"
+                (DATA / "frames" / name).write_bytes(jpeg)
+                last_frame = t0
             except OSError as e:    # a full disk must not stop the sleep tracking
                 log(error=f"could not save frame: {e}"[:200])
         prev = label
@@ -314,7 +356,7 @@ def main():
         save(tr)    # queued before the call, so a crash cannot lose it
         flush(tr)
         save(tr)
-        wait(tr, t0)
+        why = wait(tr, t0)
 
 
 def selftest():
@@ -396,6 +438,27 @@ def selftest():
     # the sensor being unavailable is retried, not treated as "someone else's timer"
     fake["state"] = "unavailable"; tr.pending = [["start", 9000.0]]
     flush(tr); assert tr.tries == 1 and len(tr.pending) == 1
+
+    # every push platform builds a request, one failing does not stop the rest, and no secret is logged
+    env = dict(NTFY_TOPIC="t", PUSHOVER_TOKEN="SECRET", PUSHOVER_USER="u", PUSHBULLET_TOKEN="SECRET",
+               TELEGRAM_BOT_TOKEN="SECRET", TELEGRAM_CHAT_ID="1", GOTIFY_URL="http://g/", GOTIFY_TOKEN="SECRET",
+               DISCORD_WEBHOOK="http://d/SECRET", SLACK_WEBHOOK="http://s/SECRET", WEBHOOK_URL="http://w/SECRET")
+    os.environ.update(env); globals()["NOTIFY"] = "notify.phone"
+    got = list(pushes("T", "M"))
+    assert [g[0] for g in got] == ["home assistant", "ntfy", "pushover", "pushbullet", "telegram", "gotify", "discord", "slack", "webhook"]
+    assert all(u.startswith("http") and json.dumps(b) for _, u, b, _ in got) and got[5][1] == "http://g/message"
+    def fake_req(url, body=None, headers=None, timeout=30):
+        if "telegram" in url:
+            raise OSError(url)
+    out, real_req, real_log = [], _req, log
+    globals().update(_req=fake_req, log=lambda **kw: out.append(json.dumps(kw)))
+    assert notify("M") is True and "telegram push failed" in "".join(out) and "SECRET" not in "".join(out)
+    globals()["_req"] = lambda *a, **k: (_ for _ in ()).throw(OSError("down"))
+    assert notify("M") is False
+    globals().update(_req=real_req, log=real_log, NOTIFY="")
+    for k in env:
+        del os.environ[k]
+    assert notify("nothing configured") is True
 
     # sensor triggers, on a fake clock
     clock, feeds = [0.0], {}

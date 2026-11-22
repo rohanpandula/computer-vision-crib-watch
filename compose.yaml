@@ -20,3 +20,26 @@ services:
       - no-new-privileges:true
     pids_limit: 64
     mem_limit: 128m
+
+  # Optional frame review page. Off unless you ask for it:
+  #   docker compose --profile review up -d
+  # It has no login, so anyone on your network can open it and see the saved frames.
+  review:
+    profiles: ["review"]
+    image: python:3.12-slim
+    container_name: sleep-logger-review
+    restart: unless-stopped
+    network_mode: host
+    command: ["python", "-u", "/app/review.py"]
+    environment:
+      REVIEW_PORT: ${REVIEW_PORT:-8765}
+    volumes:
+      - ./review.py:/app/review.py:ro
+      - ./data:/data
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 128m

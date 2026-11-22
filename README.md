@@ -16,7 +16,9 @@ Every two minutes the script takes a snapshot of the crib camera through Home As
 - Retries a failed Huckleberry call until it goes through, and can send a push when the camera or model has been down for a while
 - Leaves the timer alone if someone already started one by hand
 - Dry-run mode records what it would log without touching Huckleberry
-- One Python file, standard library only, no image to build
+- A one-tap review page for checking the model's reads on your phone
+- Problem alerts through Home Assistant, ntfy, Pushover, Pushbullet, Telegram, Gotify, Discord, Slack or a webhook
+- Two small Python files, standard library only, no image to build
 - Optional cry alerts for cameras that have a microphone but no cry detection of their own
 
 ## Requirements
@@ -48,7 +50,7 @@ Every two minutes the script takes a snapshot of the crib camera through Home As
    | `SLEEP_SENSOR` | The child's sleep sensor from the Huckleberry integration |
    | `OLLAMA_URL`, `MODEL` | Your Ollama server and vision model |
    | `DRY_RUN` | `1` records only, `0` writes to Huckleberry |
-   | `NOTIFY_SERVICE` | Optional. A notify service for problem alerts, for example `notify.mobile_app_my_phone` |
+   | `NOTIFY_SERVICE` | Optional. A Home Assistant notify service for problem alerts, for example `notify.mobile_app_my_phone`. Other platforms are listed under [Problem alerts](#problem-alerts) |
    | `CRY_SENSOR` | Optional. A cry sensor, for example `binary_sensor.crib_cry` from the cry alerts below |
    | `MOTION_SENSOR` | Optional. The camera's motion sensor, for example `binary_sensor.crib_motion` |
 
@@ -82,7 +84,7 @@ A sleep ends at the first frame where the baby was awake or gone, not at the mom
 
 If you set `MOTION_SENSOR`, new motion during a sleep triggers a check right away instead of waiting for the next one. Motion never ends a sleep by itself. It only makes the script look sooner, and the vision model still decides.
 
-If a call to Huckleberry fails, it is kept and tried again on every check until it goes through, including across restarts. With `NOTIFY_SERVICE` set you get a push after 15 failed tries in a row (`RETRY_ALERT_TRIES`), and another when the camera or the model has been unreachable for 15 minutes (`BLIND_ALERT_MIN`). The pushes go through Home Assistant, so they cannot tell you that Home Assistant itself is down.
+If a call to Huckleberry fails, it is kept and tried again on every check until it goes through, including across restarts.
 
 If you set `CRY_SENSOR`, a cry during a sleep also triggers a check right away. If the baby is then seen awake or gone within 10 minutes, the sleep ends at the time of the cry, since that is when the baby really woke. A cry the baby settles from changes nothing.
 
@@ -93,11 +95,48 @@ When the model is unsure, or a snapshot fails, that check is ignored. It neither
 Everything it writes goes to the `data` folder:
 
 - `events.jsonl` has one line per sleep it started, completed or cancelled
-- `frames/` keeps the snapshot from each change of state for three days, so you can look at the frame behind a wrong call
+- `frames/` keeps the snapshots worth a second look for three days: each change of state, each look a cry asked for, and awake reads and motion looks at most once every 10 minutes
+- `labeled/` holds the frames you have reviewed (see below). These are kept until you delete them
 - `state.json` lets a sleep in progress survive a restart
 
 > [!NOTE]
 > The saved frames are pictures of your child. They never leave the machine running the script, but treat that folder accordingly.
+
+### Review page
+
+The review page shows those saved frames one at a time with the model's read, and you tap what the frame really shows: asleep, awake or empty. Awake reads and cry-triggered looks come first. It is built for a phone, and there is an undo for a wrong tap.
+
+```sh
+docker compose --profile review up -d
+```
+
+Then open `http://<the machine running it>:8765`. Change the port with `REVIEW_PORT`.
+
+Reviewing changes nothing in Huckleberry. Each reviewed frame moves to `data/labeled/` with your answer in its file name, for example `20260101-031500_asleep_is_awake.jpg`, and the page shows how often the model has been right. That folder is a ready-made test set for changing the prompt or trying another model.
+
+> [!WARNING]
+> The review page has no login. Anyone who can reach that port on your network can see the frames. Do not expose it to the internet.
+
+## Problem alerts
+
+The script can tell you when it needs help: the camera or the model has been unreachable for 15 minutes (`BLIND_ALERT_MIN`), or 15 Huckleberry calls in a row have failed (`RETRY_ALERT_TRIES`), repeated every 15 more while it lasts. Fill in the settings for any of these platforms in `.env` and every one that is filled in gets the message.
+
+| Platform | Settings |
+|---|---|
+| Home Assistant | `NOTIFY_SERVICE` |
+| ntfy | `NTFY_TOPIC`, optionally `NTFY_URL` and `NTFY_TOKEN` |
+| Pushover | `PUSHOVER_TOKEN`, `PUSHOVER_USER` |
+| Pushbullet | `PUSHBULLET_TOKEN` |
+| Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` |
+| Gotify | `GOTIFY_URL`, `GOTIFY_TOKEN` |
+| Discord | `DISCORD_WEBHOOK` |
+| Slack | `SLACK_WEBHOOK` |
+| Anything else | `WEBHOOK_URL`, which receives JSON with `title` and `message` |
+
+> [!NOTE]
+> Only the Home Assistant platform has been used for real. The others follow each service's published API but are untested. An alert sent through Home Assistant cannot tell you that Home Assistant itself is down, which is one reason to add a second platform.
+
+These are alerts about the script, not about the baby. The cry notification below is a Home Assistant automation, and it can use any notify service Home Assistant supports.
 
 ## Cry alerts (optional)
 
@@ -145,6 +184,7 @@ The sleep rules are a small state machine with a built-in check:
 
 ```sh
 python3 sleep_logger.py --selftest
+python3 review.py --selftest
 ```
 
 ## Limitations
@@ -156,3 +196,4 @@ python3 sleep_logger.py --selftest
 - While it runs, the vision model stays loaded on the Ollama server and holds its memory.
 - Cry alerts have been checked with a live microphone feed and a simulated detection, but not yet against a real cry. Expect to adjust `min_volume` and `threshold` for your room.
 - The critical alert switch has not been tried on a phone yet.
+- The model has not yet been seen to read an awake baby correctly. In practice a cry or an empty crib ends the sleep. The review page is there to collect the frames needed to fix this.
