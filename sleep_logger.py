@@ -18,8 +18,10 @@ CAMERA = os.environ.get("CAMERA", "")                      # e.g. camera.crib
 DEVICE_ID = os.environ.get("HUCKLEBERRY_DEVICE_ID", "")    # the child's device in Home Assistant
 SLEEP_SENSOR = os.environ.get("SLEEP_SENSOR", "")          # e.g. sensor.<child>_sleep
 MOTION = os.environ.get("MOTION_SENSOR", "")                # optional, e.g. binary_sensor.crib_motion
+NOTIFY = os.environ.get("NOTIFY_SERVICE", "")               # optional, e.g. notify.mobile_app_my_phone
 DRY_RUN = os.environ.get("DRY_RUN", "1") != "0"
 DATA = pathlib.Path(os.environ.get("DATA_DIR", "/data"))
+STATE = DATA / "state.json"
 REQUIRED = {"HA_TOKEN": TOKEN, "CAMERA": CAMERA, "HUCKLEBERRY_DEVICE_ID": DEVICE_ID, "SLEEP_SENSOR": SLEEP_SENSOR}
 
 # Tuning knobs (minutes unless noted). Real cribs and real babies need tuning.
@@ -28,6 +30,8 @@ ASLEEP_CHECKS = int(os.environ.get("ASLEEP_CHECKS", "3"))      # asleep frames i
 WAKE_MIN = float(os.environ.get("WAKE_MIN", "10"))             # awake/empty this long ends the sleep
 MIN_SLEEP_MIN = float(os.environ.get("MIN_SLEEP_MIN", "10"))   # shorter than this is discarded
 OFFLINE_END_MIN = float(os.environ.get("OFFLINE_END_MIN", "60"))  # camera blind this long ends the sleep
+BLIND_ALERT_MIN = float(os.environ.get("BLIND_ALERT_MIN", "15"))  # camera/model failing this long sends a push
+RETRY_ALERT_TRIES = int(os.environ.get("RETRY_ALERT_TRIES", "15"))  # failed Huckleberry calls in a row before a push
 FRAME_KEEP_DAYS = 3
 
 PROMPT = ("Overhead view of a baby crib (may be night vision). Report whether a baby is in the "
@@ -46,13 +50,14 @@ class Tracker:
     label: "asleep" | "awake" | "empty" | None (unsure / camera or model unavailable).
     events: ("start", start_ts) | ("complete", start_ts, end_ts) | ("cancel", start_ts, end_ts)
     """
-    FIELDS = ("run", "run_start", "start", "last_asleep", "wake_since", "owned")
+    FIELDS = ("run", "run_start", "start", "last_asleep", "wake_since", "owned", "pending", "tries")
 
     def __init__(self, saved=None):
         self.run, self.run_start = 0, None      # consecutive asleep frames while idle
         self.start = None                       # sleep start ts while sleeping
         self.last_asleep = self.wake_since = None
         self.owned = False                      # did we start the Huckleberry timer?
+        self.pending, self.tries = [], 0        # events not yet delivered to Huckleberry
         for k, v in (saved or {}).items():
             if k in self.FIELDS:
                 setattr(self, k, v)
@@ -63,24 +68,30 @@ class Tracker:
     def step(self, label, t):
         if self.start is None:
             if label == "asleep":
+                # asleep frames separated by a long gap are not one streak
+                if self.run and (self.last_asleep is None or t - self.last_asleep > WAKE_MIN * 60):
+                    self.run = 0
                 if self.run == 0:
                     self.run_start = t
                 self.run += 1
+                self.last_asleep = t
                 if self.run >= ASLEEP_CHECKS:
                     self.start, self.last_asleep, self.wake_since, self.run = self.run_start, t, None, 0
                     return [("start", self.start)]
             elif label is not None:
                 self.run = 0
             return []
-        if label == "asleep":
-            self.last_asleep, self.wake_since = t, None
-        elif label is not None and self.wake_since is None:
-            self.wake_since = t
         end = None
-        if self.wake_since is not None and t - self.wake_since >= WAKE_MIN * 60:
-            end = self.wake_since
-        elif t - self.last_asleep >= OFFLINE_END_MIN * 60:
-            end = self.last_asleep
+        if t - self.last_asleep >= OFFLINE_END_MIN * 60:
+            end = self.last_asleep          # checked first: a frame after a long gap belongs to a new sleep
+        elif label == "asleep":
+            self.last_asleep, self.wake_since = t, None
+        elif label is not None:
+            if self.wake_since is None:
+                self.wake_since = t
+            # only a frame that still shows awake/empty confirms the wake-up; blind time does not
+            if t - self.wake_since >= WAKE_MIN * 60:
+                end = self.wake_since
         if end is None:
             return []
         start, self.start, self.wake_since = self.start, None, None
@@ -104,9 +115,10 @@ def classify(jpeg):
             "options": {"temperature": 0},
             "messages": [{"role": "user", "content": PROMPT, "images": [base64.b64encode(jpeg).decode()]}]}
     raw = json.loads(json.loads(_req(OLLAMA + "/api/chat", body, timeout=300))["message"]["content"])
-    if not raw.get("baby_in_crib"):
+    if raw.get("baby_in_crib") is False:
         return "empty", raw
-    return (raw["state"] if raw.get("state") in ("asleep", "awake") else None), raw
+    ok = raw.get("baby_in_crib") is True and raw.get("state") in ("asleep", "awake")
+    return (raw["state"] if ok else None), raw      # a malformed reply counts as unsure
 
 
 def iso(ts):
@@ -118,9 +130,30 @@ def log(**kw):
 
 
 def record(event):
-    with open(DATA / "events.jsonl", "a") as f:
-        f.write(json.dumps(event) + "\n")
     log(**event)
+    try:
+        with open(DATA / "events.jsonl", "a") as f:
+            f.write(json.dumps(event) + "\n")
+    except OSError as e:    # the Huckleberry call already went through; never retry it over a log line
+        log(error=f"could not write events.jsonl: {e}"[:200])
+
+
+def save(tr):
+    try:
+        tmp = STATE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(tr.dump()))
+        os.replace(tmp, STATE)      # atomic: a kill mid-write cannot leave a half-written file
+    except OSError as e:
+        log(error=f"could not save state: {e}"[:200])
+
+
+def timer():
+    """Huckleberry timer state and, if one is running, when it started."""
+    s = json.loads(ha("/api/states/" + SLEEP_SENSOR))
+    if s["state"] not in ("none", "active", "paused"):
+        raise RuntimeError("sleep sensor is " + s["state"])     # unavailable: try again later
+    cur = (s.get("attributes") or {}).get("current_start")
+    return s["state"], (datetime.fromisoformat(cur).timestamp() if cur else None)
 
 
 def act(tr, ev):
@@ -129,22 +162,61 @@ def act(tr, ev):
     if kind != "start":
         event.update(end=iso(ev[2]), minutes=round((ev[2] - start) / 60))
     if not DRY_RUN:
-        timer = json.loads(ha("/api/states/" + SLEEP_SENSOR))["state"]
+        state, cur = timer()
         dev = {"device_id": DEVICE_ID}
         if kind == "start":
-            # Someone (or something) already has a sleep running: leave it alone.
-            tr.owned = timer == "none"
-            if tr.owned:
+            if state == "none":
                 ha("/api/services/huckleberry/start_sleep", {**dev, "start_time": iso(start)})
-        elif tr.owned and timer != "none":
-            if kind == "complete":
-                ha("/api/services/huckleberry/complete_sleep", {**dev, "end_time": iso(ev[2])})
+                tr.owned = True
             else:
-                ha("/api/services/huckleberry/cancel_sleep", dev)
+                # A timer is already running. It is ours only if it has our start time, which
+                # means an earlier try got through. Anyone else's timer is left alone.
+                tr.owned = cur is not None and abs(cur - start) < 90
+            event["owned"] = tr.owned
         else:
-            event["skipped"] = "timer not ours or already ended by hand"
-        event["owned"] = tr.owned
+            # End only the timer we started: one that began after our end time is someone's new one.
+            # (The start time itself may have been edited in the app, so it is not compared.)
+            event["owned"] = tr.owned
+            if tr.owned and state != "none" and (cur is None or cur < ev[2]):
+                if kind == "complete":
+                    ha("/api/services/huckleberry/complete_sleep", {**dev, "end_time": iso(ev[2])})
+                else:
+                    ha("/api/services/huckleberry/cancel_sleep", dev)
+            else:
+                event["skipped"] = "timer not ours or already ended by hand"
+            tr.owned = False
     record(event)
+
+
+def notify(message):
+    """Returns False only if a push was wanted and could not be sent, so the caller can try again."""
+    log(notify=message, sent=bool(NOTIFY))
+    if not NOTIFY:
+        return True
+    try:
+        ha("/api/services/" + NOTIFY.replace(".", "/"), {"title": "Crib watch", "message": message})
+        return True
+    except Exception as e:  # the push goes through Home Assistant, so it cannot report HA itself being down
+        log(error=f"notify failed: {type(e).__name__}: {e}"[:300])
+        return False
+
+
+def flush(tr):
+    """Deliver queued events in order. A failed call stays queued and is retried on every
+    check until it goes through; nothing is dropped, so a sleep is never left half-logged."""
+    while tr.pending:
+        ev = tr.pending[0]
+        try:
+            act(tr, ev)
+        except Exception as e:
+            tr.tries += 1
+            log(error=f"huckleberry call failed: {type(e).__name__}: {e}"[:300], event=ev[0], tries=tr.tries)
+            if tr.tries == RETRY_ALERT_TRIES:
+                notify(f"Can't send a sleep {ev[0]} to Huckleberry ({tr.tries} tries so far). Still retrying.")
+            return
+        tr.pending.pop(0)
+        tr.tries = 0
+        save(tr)    # checkpoint each delivered event, so a restart does not send it twice
 
 
 def prune_frames():
@@ -154,7 +226,7 @@ def prune_frames():
             p.unlink()
 
 
-motion_was_on = False
+motion_was_on = None    # unknown until the first valid reading, so a restart is not mistaken for new motion
 
 
 def wait(tr, t0):
@@ -163,14 +235,17 @@ def wait(tr, t0):
     global motion_was_on
     end = max(time.time() + 5, t0 + INTERVAL)
     while time.time() < end:
-        time.sleep(min(10, end - time.time()))
+        time.sleep(max(0, min(10, end - time.time())))
         if not MOTION or tr.start is None:
             continue
         try:
-            on = json.loads(ha("/api/states/" + MOTION))["state"] == "on"
+            st = json.loads(ha("/api/states/" + MOTION))["state"]
         except Exception:
             continue
-        fresh, motion_was_on = on and not motion_was_on, on
+        if st not in ("on", "off"):     # unavailable / unknown is not a reading
+            continue
+        on = st == "on"
+        fresh, motion_was_on = on and motion_was_on is False, on
         if fresh:
             log(msg="motion, looking now")
             return
@@ -181,34 +256,45 @@ def main():
     if missing:
         sys.exit("missing settings: " + ", ".join(missing) + " (see .env.example)")
     (DATA / "frames").mkdir(parents=True, exist_ok=True)
-    state_file = DATA / "state.json"
-    tr = Tracker(json.loads(state_file.read_text()) if state_file.exists() else None)
+    try:
+        saved = json.loads(STATE.read_text()) if STATE.exists() else None
+    except ValueError:
+        saved = None
+        log(error="state.json unreadable, starting fresh")
+    tr = Tracker(saved)
     log(msg="sleep logger up", dry_run=DRY_RUN, camera=CAMERA, model=MODEL, state=tr.dump())
-    prev = "?"
+    prev, blind_since, blind_told = "?", None, False
     while True:
         t0 = time.time()
-        label, raw, jpeg = None, None, None
+        label, raw, jpeg, failed = None, None, None, False
         try:
             jpeg = ha("/api/camera_proxy/" + CAMERA)
             label, raw = classify(jpeg)
         except Exception as e:  # camera offline, tunnel down, model busy: counts as "can't see"
-            raw = {"error": f"{type(e).__name__}: {e}"[:200]}
+            raw, failed = {"error": f"{type(e).__name__}: {e}"[:200]}, True
+        blind_since = (blind_since or t0) if failed else None
+        if failed and not blind_told and t0 - blind_since >= BLIND_ALERT_MIN * 60:
+            blind_told = notify(f"Can't see the crib for {round((t0 - blind_since) / 60)} minutes: {raw['error']}")
+        elif not failed and blind_told:
+            blind_told = not notify("Can see the crib again.")
         log(label=label, raw=raw, secs=round(time.time() - t0, 1))
         if jpeg and label != prev:  # keep the frame at every change, to review mistakes later
-            (DATA / "frames" / f"{time.strftime('%Y%m%d-%H%M%S')}_{label}.jpg").write_bytes(jpeg)
-            prune_frames()
-        prev = label
-        for ev in tr.step(label, t0):
             try:
-                act(tr, ev)
-            except Exception as e:
-                log(error=f"huckleberry call failed: {type(e).__name__}: {e}"[:300], event=ev[0])
-        state_file.write_text(json.dumps(tr.dump()))
+                prune_frames()
+                (DATA / "frames" / f"{time.strftime('%Y%m%d-%H%M%S')}_{label}.jpg").write_bytes(jpeg)
+            except OSError as e:    # a full disk must not stop the sleep tracking
+                log(error=f"could not save frame: {e}"[:200])
+        prev = label
+        tr.pending += [list(ev) for ev in tr.step(label, t0)]
+        save(tr)    # queued before the call, so a crash cannot lose it
+        flush(tr)
+        save(tr)
         wait(tr, t0)
 
 
 def selftest():
-    global ha, MOTION
+    global ha, MOTION, DRY_RUN, record, save
+    globals().update(INTERVAL=120, ASLEEP_CHECKS=3, WAKE_MIN=10, MIN_SLEEP_MIN=10, OFFLINE_END_MIN=60)
     m = 60
     def run(seq, step=2 * m):
         tr, out = Tracker(), []
@@ -234,15 +320,62 @@ def selftest():
     # state survives a restart
     tr = Tracker(); [tr.step(A, i * 2 * m) for i in range(5)]
     assert Tracker(json.loads(json.dumps(tr.dump()))).dump() == tr.dump()
+    # asleep frames either side of a long blind gap are not one streak
+    assert run([A, A] + [N] * 10 + [A]) == []
+    # one awake frame followed by blind time does not end the sleep
+    assert run([A] * 10 + [W] + [N] * 8 + [A, A]) == [("start", 0)]
+    # an asleep frame after a 2-hour gap closes the old sleep at its last asleep frame
+    tr = Tracker(); [tr.step(A, i * 2 * m) for i in range(10)]
+    assert tr.step(A, 18 * m + 7200) == [("complete", 0, 18 * m)]
+    # a malformed model reply is "unsure", never "empty"
+    for reply, want in (({}, None), ({"baby_in_crib": False}, "empty"), ({"baby_in_crib": True, "state": "awake"}, "awake")):
+        _real, globals()["_req"] = _req, lambda *a, **k: json.dumps({"message": {"content": json.dumps(reply)}})
+        assert classify(b"x")[0] == want, reply
+        globals()["_req"] = _real
+
+    # delivery, against a fake Home Assistant
+    fake = {"state": "none", "cur": None, "calls": [], "boom": 0}
+    def ha(path, body=None):
+        if path.startswith("/api/states/"):
+            return json.dumps({"state": fake["state"], "attributes": {"current_start": fake["cur"]}})
+        svc = path.rsplit("/", 1)[1]
+        fake["calls"].append(svc)
+        if svc == "start_sleep":
+            fake["state"], fake["cur"] = "active", body["start_time"]
+        else:
+            fake["state"], fake["cur"] = "none", None
+        if fake["boom"]:
+            fake["boom"] -= 1
+            raise TimeoutError("applied, but the reply was lost")
+    DRY_RUN, record, save = False, (lambda e: None), (lambda tr: None)
+    # the start goes through but its reply is lost: the retry adopts that timer and does not start another
+    tr = Tracker(); tr.pending = [["start", 1000.0], ["complete", 1000.0, 4000.0]]; fake["boom"] = 1
+    flush(tr); assert tr.tries == 1 and len(tr.pending) == 2
+    flush(tr); assert fake["calls"] == ["start_sleep", "complete_sleep"] and tr.pending == [] and not tr.owned
+    # a queued end never touches a timer someone started after that sleep ended
+    fake.update(state="active", cur=iso(4100.0), calls=[])
+    tr = Tracker(); tr.owned = True; tr.pending = [["complete", 1000.0, 4000.0]]
+    flush(tr); assert fake["calls"] == [] and fake["state"] == "active" and tr.pending == []
+    # a start never takes over a timer that is already running with a different start time
+    tr = Tracker(); tr.pending = [["start", 9000.0]]
+    flush(tr); assert fake["calls"] == [] and not tr.owned
+    # the sensor being unavailable is retried, not treated as "someone else's timer"
+    fake["state"] = "unavailable"; tr.pending = [["start", 9000.0]]
+    flush(tr); assert tr.tries == 1 and len(tr.pending) == 1
+
     # new motion during a sleep cuts the wait short; motion that is still going does not
     clock, feed = [0.0], ["off", "on"]
     time.time, time.sleep = (lambda: clock[0]), (lambda s: clock.__setitem__(0, clock[0] + s))
+    feed += []; globals()["motion_was_on"] = None
     MOTION, ha = "x", lambda path, body=None: json.dumps({"state": feed.pop(0) if feed else "on"})
     tr = Tracker(); tr.start = 0
     wait(tr, 0); assert clock[0] == 20, clock
     wait(tr, 20); assert clock[0] == 20 + INTERVAL, clock
     tr.start = None; feed[:] = ["off", "on"]          # not sleeping: motion is ignored
     wait(tr, clock[0]); assert clock[0] == 20 + 2 * INTERVAL, clock
+    # after a restart, motion that is already on (or unavailable in between) is not a new edge
+    globals()["motion_was_on"] = None; tr.start = 0; feed[:] = ["on", "unavailable", "on"]
+    t = clock[0]; wait(tr, t); assert clock[0] == t + INTERVAL, clock
     print("selftest ok")
 
 
