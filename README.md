@@ -12,6 +12,7 @@ Every two minutes the script takes a snapshot of the crib camera through Home As
 - Works with any camera Home Assistant can take a snapshot from, including night vision
 - Sleeps are backdated to the first frame the baby was seen asleep
 - Short stirs do not split a sleep, and very short sleeps are thrown away
+- Can use the camera's motion sensor to look right away when the baby stirs, so wake times are accurate to seconds
 - Leaves the timer alone if someone already started one by hand
 - Dry-run mode records what it would log without touching Huckleberry
 - One Python file, standard library only, no image to build
@@ -46,6 +47,7 @@ Every two minutes the script takes a snapshot of the crib camera through Home As
    | `SLEEP_SENSOR` | The child's sleep sensor from the Huckleberry integration |
    | `OLLAMA_URL`, `MODEL` | Your Ollama server and vision model |
    | `DRY_RUN` | `1` records only, `0` writes to Huckleberry |
+   | `MOTION_SENSOR` | Optional. The camera's motion sensor, for example `binary_sensor.crib_motion` |
 
    To find the device id, open Developer tools, then Template, in Home Assistant and enter:
 
@@ -74,6 +76,8 @@ Every two minutes the script takes a snapshot of the crib camera through Home As
 | Time between checks | 120 seconds | `INTERVAL_S` |
 
 A sleep ends at the first frame where the baby was awake or gone, not at the moment the rule fires. If the camera drops out, the sleep ends at the last frame where the baby was seen asleep.
+
+If you set `MOTION_SENSOR`, new motion during a sleep triggers a check right away instead of waiting for the next one. Motion never ends a sleep by itself. It only makes the script look sooner, and the vision model still decides.
 
 When the model is unsure, or a snapshot fails, that check is ignored. It neither starts nor ends anything.
 

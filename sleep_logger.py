@@ -17,6 +17,7 @@ MODEL = os.environ.get("MODEL", "gemma4:12b-it-qat")
 CAMERA = os.environ.get("CAMERA", "")                      # e.g. camera.crib
 DEVICE_ID = os.environ.get("HUCKLEBERRY_DEVICE_ID", "")    # the child's device in Home Assistant
 SLEEP_SENSOR = os.environ.get("SLEEP_SENSOR", "")          # e.g. sensor.<child>_sleep
+MOTION = os.environ.get("MOTION_SENSOR", "")                # optional, e.g. binary_sensor.crib_motion
 DRY_RUN = os.environ.get("DRY_RUN", "1") != "0"
 DATA = pathlib.Path(os.environ.get("DATA_DIR", "/data"))
 REQUIRED = {"HA_TOKEN": TOKEN, "CAMERA": CAMERA, "HUCKLEBERRY_DEVICE_ID": DEVICE_ID, "SLEEP_SENSOR": SLEEP_SENSOR}
@@ -153,6 +154,28 @@ def prune_frames():
             p.unlink()
 
 
+motion_was_on = False
+
+
+def wait(tr, t0):
+    """Sleep until the next check. During a sleep, new motion cuts the wait short so the
+    wake time is caught to within seconds. Motion already under way does not re-trigger."""
+    global motion_was_on
+    end = max(time.time() + 5, t0 + INTERVAL)
+    while time.time() < end:
+        time.sleep(min(10, end - time.time()))
+        if not MOTION or tr.start is None:
+            continue
+        try:
+            on = json.loads(ha("/api/states/" + MOTION))["state"] == "on"
+        except Exception:
+            continue
+        fresh, motion_was_on = on and not motion_was_on, on
+        if fresh:
+            log(msg="motion, looking now")
+            return
+
+
 def main():
     missing = [k for k, v in REQUIRED.items() if not v]
     if missing:
@@ -181,10 +204,11 @@ def main():
             except Exception as e:
                 log(error=f"huckleberry call failed: {type(e).__name__}: {e}"[:300], event=ev[0])
         state_file.write_text(json.dumps(tr.dump()))
-        time.sleep(max(5, INTERVAL - (time.time() - t0)))
+        wait(tr, t0)
 
 
 def selftest():
+    global ha, MOTION
     m = 60
     def run(seq, step=2 * m):
         tr, out = Tracker(), []
@@ -210,6 +234,15 @@ def selftest():
     # state survives a restart
     tr = Tracker(); [tr.step(A, i * 2 * m) for i in range(5)]
     assert Tracker(json.loads(json.dumps(tr.dump()))).dump() == tr.dump()
+    # new motion during a sleep cuts the wait short; motion that is still going does not
+    clock, feed = [0.0], ["off", "on"]
+    time.time, time.sleep = (lambda: clock[0]), (lambda s: clock.__setitem__(0, clock[0] + s))
+    MOTION, ha = "x", lambda path, body=None: json.dumps({"state": feed.pop(0) if feed else "on"})
+    tr = Tracker(); tr.start = 0
+    wait(tr, 0); assert clock[0] == 20, clock
+    wait(tr, 20); assert clock[0] == 20 + INTERVAL, clock
+    tr.start = None; feed[:] = ["off", "on"]          # not sleeping: motion is ignored
+    wait(tr, clock[0]); assert clock[0] == 20 + 2 * INTERVAL, clock
     print("selftest ok")
 
 
