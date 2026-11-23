@@ -5,6 +5,7 @@ It relays the sound that the cry-alert container already receives, and nothing e
 and none of that container's other controls. There is no login. Run `listen.py --selftest`
 to check the logic.
 """
+import http.client
 import os
 import socket
 import struct
@@ -19,6 +20,7 @@ NAME = os.environ.get("LISTEN_NAME", "crib-audio").strip().lower()   # <name>.lo
 SOURCE = os.environ.get("LISTEN_SOURCE", "http://127.0.0.1:1984/api/stream.aac?src=crib")
 IP = os.environ.get("LISTEN_IP", "")            # address to advertise; found automatically if empty
 MAX_LISTENERS = 8
+RETRY = 2                                       # seconds between tries when the camera's sound drops
 MDNS = ("224.0.0.251", 5353)
 TTL = 120
 SERVICE = "_http._tcp.local"
@@ -32,15 +34,30 @@ padding:22px 44px;border-radius:14px;border:0;background:#2d6cdf;color:#fff}p{ma
 <script>
 const a=document.getElementById("a"),b=document.getElementById("b"),s=document.getElementById("s");
 let on=false,timer;
-function play(){a.src="/stream.aac?"+Date.now();a.play().catch(()=>retry())}
+function play(){clearTimeout(timer);a.src="/stream.aac?"+Date.now();a.play().catch(()=>retry())}
 function retry(){if(!on)return;s.textContent="Reconnecting";clearTimeout(timer);timer=setTimeout(play,2000)}
 b.onclick=()=>{on=!on;b.textContent=on?"Stop":"Listen";
   if(on){s.textContent="Connecting";play()}else{clearTimeout(timer);a.pause();a.removeAttribute("src");a.load();s.textContent="Stopped"}};
 a.onplaying=()=>{if(on)s.textContent="Live"};
+a.onwaiting=()=>{if(on)s.textContent="Waiting for sound"};
 a.onerror=a.onended=retry;
+// lock screen and control centre: a title, and play and pause buttons that work without unlocking
+if("mediaSession" in navigator){
+  navigator.mediaSession.metadata=new MediaMetadata({title:"Crib audio",artist:"Live"});
+  navigator.mediaSession.setActionHandler("play",()=>{if(on){s.textContent="Connecting";play()}else b.onclick()});
+  navigator.mediaSession.setActionHandler("pause",()=>{if(on)b.onclick()});
+}
 </script></html>""".encode()
 
 slots = threading.BoundedSemaphore(MAX_LISTENERS)
+
+
+def keepalive(sock):
+    """Notice within about a minute that a phone vanished (left Wi-Fi) while nothing is being sent to it."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for opt, value in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3)):
+        if hasattr(socket, opt):                    # Linux names; elsewhere the system defaults apply
+            sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), value)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -67,22 +84,33 @@ class Handler(BaseHTTPRequestHandler):
     def stream(self):
         if not slots.acquire(blocking=False):
             return self.send_error(503, "Too many listeners")
+        keepalive(self.connection)
+        started = False
         try:
-            try:
-                up = urllib.request.urlopen(SOURCE, timeout=10)
-            except OSError:
-                return self.send_error(502, "No audio from the camera")
-            with up:
-                self.send_response(200)
-                self.send_header("Content-Type", "audio/aac")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.connection.settimeout(15)      # a listener that stops reading is dropped
-                while chunk := up.read1(4096):
-                    self.wfile.write(chunk)
+            while True:
+                try:
+                    with urllib.request.urlopen(SOURCE, timeout=10) as up:
+                        if not started:
+                            started = True                      # from here on, never a second reply
+                            self.send_response(200)
+                            self.send_header("Content-Type", "audio/aac")
+                            self.send_header("Cache-Control", "no-store")
+                            self.send_header("Connection", "close")
+                            self.end_headers()
+                            self.connection.settimeout(15)      # a listener that stops reading is dropped
+                        while chunk := up.read1(4096):
+                            try:
+                                self.wfile.write(chunk)
+                            except OSError:
+                                return                          # the listener left
+                except (OSError, http.client.HTTPException):
+                    if not started:
+                        return self.send_error(502, "No audio from the camera")
+                # The camera's sound dropped. Keep this listener and reconnect, because a locked
+                # phone cannot reconnect by itself. A listener that left is noticed on the next write.
+                time.sleep(RETRY)
         except OSError:
-            pass                                    # the listener left, or the camera dropped out
+            pass
         finally:
             self.close_connection = True
             slots.release()
@@ -214,10 +242,12 @@ def selftest():
             pass
 
         def do_GET(self):
+            hits.append(1)
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(b"\xff\xf1audio")
+            self.wfile.write(b"\xff\xf1audio%d" % len(hits))
 
+    hits = []
     up = ThreadingHTTPServer(("127.0.0.1", 0), Fake)
     me = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     for srv in (up, me):
@@ -232,11 +262,13 @@ def selftest():
         except urllib.error.HTTPError as e:
             return e.code, b""
 
-    assert get("/stream.aac") == (200, b"\xff\xf1audio")
+    globals()["RETRY"] = 0.05
+    with urllib.request.urlopen(base + "/stream.aac", timeout=5) as r:      # the fake camera hangs up after
+        assert r.read(16) == b"\xff\xf1audio1\xff\xf1audio2"                 # each reply: the relay reconnects
     assert get("/")[1] == PAGE
     assert get("/api/streams")[0] == 404 and get("/stream.aac/../api")[0] == 404
     for _ in range(MAX_LISTENERS):
-        slots.acquire()
+        assert slots.acquire(timeout=5), "a finished listener did not give its slot back"
     assert get("/stream.aac")[0] == 503
     for _ in range(MAX_LISTENERS):
         slots.release()

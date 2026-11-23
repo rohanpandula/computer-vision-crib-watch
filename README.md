@@ -192,6 +192,8 @@ docker compose --profile listen up -d
 
 Then open `http://crib-audio.local:8766` on a phone or computer on the same network and press Listen. The page plays the camera's sound only, with no video. The stream itself is at `/stream.aac` if you would rather open it in an audio player such as VLC.
 
+If the camera's sound drops, for example while the cry-alert container restarts, the server keeps your connection open and the sound comes back by itself. That is meant for a locked phone, where a web page cannot reconnect, though it has not been tried on one yet. The page also puts a title and play and pause buttons on the lock screen. Losing Wi-Fi on the phone itself still ends playback, and you have to press play again.
+
 The name comes from Bonjour (mDNS), so there is no address to look up, and the page also shows up in Bonjour browsers as a web service called `crib-audio`. Change the name with `LISTEN_NAME`, or set it to nothing to turn Bonjour off and use the machine's address instead.
 
 The port is `LISTEN_PORT`. Set it to `80` and the address needs no port at all, `http://crib-audio.local`, as long as nothing else on that machine already uses port 80.
@@ -222,5 +224,5 @@ python3 cry-alert/listen.py --selftest
 - While it runs, the vision model stays loaded on the Ollama server and holds its memory.
 - Cry alerts have been checked with a live microphone feed and a simulated detection, but not yet against a real cry. Expect to adjust `min_volume` and `threshold` for your room.
 - The critical alert switch has not been tried on a phone yet.
-- The listen page has been played in a desktop browser and found by name from a Mac. It has not been tried on a phone yet, and the sound runs a second or two behind the room.
+- The listen page has been played in a desktop browser and found by name from a Mac. It has not been tried on a phone yet, including with the screen locked, and the sound runs a second or two behind the room.
 - The tested model cannot make out a baby's eyes from an overhead camera, so a baby lying awake is read as asleep. A sleep can therefore start a few minutes early, and in practice a cry or an empty crib ends it. Rewording the prompt did not help on 27 hand-labeled frames. A sharper vision model or a closer camera probably would.
