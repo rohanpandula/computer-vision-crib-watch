@@ -92,6 +92,8 @@ If you set `CRY_SENSOR`, a cry during a sleep also triggers a check right away. 
 
 When the model is unsure, or a snapshot fails, that check is ignored. It neither starts nor ends anything.
 
+Before a sleep has started, a frame read as asleep with an adult's hands in the crib is treated the same way, since the baby is usually still being put down. Once a sleep is running, an adult in the frame changes nothing.
+
 ## Reviewing its calls
 
 Everything it writes goes to the `data` folder:
@@ -198,4 +200,4 @@ python3 review.py --selftest
 - While it runs, the vision model stays loaded on the Ollama server and holds its memory.
 - Cry alerts have been checked with a live microphone feed and a simulated detection, but not yet against a real cry. Expect to adjust `min_volume` and `threshold` for your room.
 - The critical alert switch has not been tried on a phone yet.
-- The model has not yet been seen to read an awake baby correctly. In practice a cry or an empty crib ends the sleep. The review page is there to collect the frames needed to fix this.
+- The tested model cannot make out a baby's eyes from an overhead camera, so a baby lying awake is read as asleep. A sleep can therefore start a few minutes early, and in practice a cry or an empty crib ends it. Rewording the prompt did not help on 27 hand-labeled frames. A sharper vision model or a closer camera probably would.

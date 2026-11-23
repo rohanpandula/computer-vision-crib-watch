@@ -121,7 +121,7 @@ def ha(path, body=None):
     return _req(HA + path, body, {"Authorization": "Bearer " + TOKEN})
 
 
-def classify(jpeg):
+def classify(jpeg, sleeping=False):
     body = {"model": MODEL, "stream": False, "think": False, "format": SCHEMA, "keep_alive": "10m",
             "options": {"temperature": 0},
             "messages": [{"role": "user", "content": PROMPT, "images": [base64.b64encode(jpeg).decode()]}]}
@@ -129,6 +129,8 @@ def classify(jpeg):
     if raw.get("baby_in_crib") is False:
         return "empty", raw
     ok = raw.get("baby_in_crib") is True and raw.get("state") in ("asleep", "awake")
+    if ok and raw["state"] == "asleep" and raw.get("adult_present") and not sleeping:
+        ok = False      # being put down with an adult's hands in the crib: do not let it start a sleep
     return (raw["state"] if ok else None), raw      # a malformed reply counts as unsure
 
 
@@ -329,7 +331,7 @@ def main():
         label, raw, jpeg, failed = None, None, None, False
         try:
             jpeg = ha("/api/camera_proxy/" + CAMERA)
-            label, raw = classify(jpeg)
+            label, raw = classify(jpeg, sleeping=tr.start is not None)
         except Exception as e:  # camera offline, tunnel down, model busy: counts as "can't see"
             raw, failed = {"error": f"{type(e).__name__}: {e}"[:200]}, True
         blind_since = (blind_since or t0) if failed else None
@@ -409,10 +411,13 @@ def selftest():
     assert run([A] * 6 + [E, E]) == [("start", 0), ("complete", 0, 12 * m)]
     assert run([A] * 6 + [E, A, A]) == [("start", 0)]
     globals()["WAKE_MIN"] = 10
-    # a malformed model reply is "unsure", never "empty"
-    for reply, want in (({}, None), ({"baby_in_crib": False}, "empty"), ({"baby_in_crib": True, "state": "awake"}, "awake")):
+    # a malformed model reply is "unsure", never "empty"; asleep with an adult in frame is "unsure" too
+    for reply, want in (({}, None), ({"baby_in_crib": False}, "empty"), ({"baby_in_crib": True, "state": "awake"}, "awake"),
+                        ({"baby_in_crib": True, "state": "asleep", "adult_present": True}, None),
+                        ({"baby_in_crib": True, "state": "asleep", "adult_present": False}, "asleep")):
         _real, globals()["_req"] = _req, lambda *a, **k: json.dumps({"message": {"content": json.dumps(reply)}})
         assert classify(b"x")[0] == want, reply
+        assert classify(b"x", sleeping=True)[0] == (want or reply.get("state")), reply   # never hides an asleep read mid-sleep
         globals()["_req"] = _real
 
     # delivery, against a fake Home Assistant
