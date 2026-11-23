@@ -182,6 +182,27 @@ By default the cry notification is an ordinary one, so it follows your phone's s
 > [!NOTE]
 > Critical alerts are an iPhone feature and must be allowed for the Home Assistant app in the iOS notification settings. On Android the switch has no effect.
 
+### Listen in (optional)
+
+The same folder can also let you hear the crib. It is off by default. Turn it on with:
+
+```sh
+docker compose --profile listen up -d
+```
+
+Then open `http://crib-audio.local:8766` on a phone or computer on the same network and press Listen. The page plays the camera's sound only, with no video. The stream itself is at `/stream.aac` if you would rather open it in an audio player such as VLC.
+
+The name comes from Bonjour (mDNS), so there is no address to look up, and the page also shows up in Bonjour browsers as a web service called `crib-audio`. Change the name with `LISTEN_NAME`, or set it to nothing to turn Bonjour off and use the machine's address instead.
+
+The port is `LISTEN_PORT`. Set it to `80` and the address needs no port at all, `http://crib-audio.local`, as long as nothing else on that machine already uses port 80.
+
+The profile starts two small containers. One serves the page and relays the sound, and it is the only way in: the camera software's own port is never opened. The other only announces the name.
+
+> [!WARNING]
+> The listen page has no login. Anyone on your network can open it and hear the room. Do not expose it to the internet.
+
+Bonjour only works when the announcing container is on your real network, which is why that one uses host networking. It will not announce itself from Docker Desktop on a Mac or Windows machine; use the machine's address there. If two machines announce the same name, pick a different `LISTEN_NAME` for one of them.
+
 ## Tests
 
 The sleep rules are a small state machine with a built-in check:
@@ -189,6 +210,7 @@ The sleep rules are a small state machine with a built-in check:
 ```sh
 python3 sleep_logger.py --selftest
 python3 review.py --selftest
+python3 cry-alert/listen.py --selftest
 ```
 
 ## Limitations
@@ -200,4 +222,5 @@ python3 review.py --selftest
 - While it runs, the vision model stays loaded on the Ollama server and holds its memory.
 - Cry alerts have been checked with a live microphone feed and a simulated detection, but not yet against a real cry. Expect to adjust `min_volume` and `threshold` for your room.
 - The critical alert switch has not been tried on a phone yet.
+- The listen page has been played in a desktop browser and found by name from a Mac. It has not been tried on a phone yet, and the sound runs a second or two behind the room.
 - The tested model cannot make out a baby's eyes from an overhead camera, so a baby lying awake is read as asleep. A sleep can therefore start a few minutes early, and in practice a cry or an empty crib ends it. Rewording the prompt did not help on 27 hand-labeled frames. A sharper vision model or a closer camera probably would.
