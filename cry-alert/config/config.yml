@@ -47,11 +47,16 @@ cameras:
   crib:
     ffmpeg:
       inputs:
+        # The classifier gets an audio-only feed. If the camera's video goes bad,
+        # the shared feed fails and takes cry detection down with it.
+        - path: rtsp://127.0.0.1:8554/crib?audio
+          input_args: preset-rtsp-restream
+          roles:
+            - audio
         - path: rtsp://127.0.0.1:8554/crib
           input_args: preset-rtsp-restream
           roles:
             - detect
-            - audio
     # Detection is off, but Frigate still wants a size. Any small value works.
     detect:
       width: 640

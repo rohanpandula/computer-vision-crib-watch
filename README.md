@@ -175,7 +175,7 @@ Two settings in `config/config.yml` control how easily it alerts:
 | `min_volume` | 300 | How loud the room must be before the classifier runs. Lower is more sensitive. |
 | `threshold` | 0.7 | How confident the classifier must be that the sound is crying. Lower gives more alerts and more false ones. |
 
-You get at most one cry notification every two minutes, and a separate notification if the audio feed has been gone for five minutes.
+You get at most one cry notification every two minutes, and a separate notification if the audio feed has been gone for five minutes. A third one covers a failure that looks alive: if the sound level stays loud for five minutes without a dip, the detector is probably broken and reporting a stuck value. That happened here once, after the camera's stream dropped and came back with bad video, and cry alerts were silently off for three hours. The classifier now reads an audio-only feed, so bad video no longer takes it down. Both feeds still come from the one camera connection, so this does not help if the camera itself is gone. A white-noise machine will also hold the level up, so raise the `-40` in the package if you use one.
 
 By default the cry notification is an ordinary one, so it follows your phone's silent and Focus settings. The package also adds a switch to Home Assistant called `Crib cry critical alert`. Turn it on and the notification becomes an iOS critical alert, which sounds even when the phone is silenced.
 

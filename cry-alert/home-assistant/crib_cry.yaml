@@ -89,3 +89,32 @@ automation:
           data:
             tag: crib-watch-cry-offline
     mode: single
+
+  # A broken audio reader can keep reporting a steady loud level instead of
+  # going quiet, so the alert above never fires. A quiet room reads about -60
+  # and real crying dips between cries. Raise -40 if your room is noisy, for
+  # example with a white-noise machine. You get one notification per fault: if
+  # it is still stuck after the cooldown, there is no second one.
+  # If Home Assistant can restart the container (for example through a switch
+  # from your server's integration), do that here before the notification.
+  - id: crib_watch_cry_stuck
+    alias: "Crib watch: cry alerts stuck"
+    description: >-
+      Phone notification if the sound level has stayed loud for five minutes
+      without a dip.
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.crib_audio_level
+        above: -40
+        for: "00:05:00"
+    actions:
+      - action: notify.mobile_app_your_phone
+        data:
+          title: Cry alerts may be broken
+          message: Sound level stuck loud for 5 minutes. Restart the cry-alert container.
+          data:
+            tag: crib-watch-cry-offline
+      # Cooldown: with mode single, no repeat until this ends.
+      - delay: "00:30:00"
+    mode: single
+    max_exceeded: silent
