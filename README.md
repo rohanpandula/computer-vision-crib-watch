@@ -224,5 +224,5 @@ python3 cry-alert/listen.py --selftest
 - While it runs, the vision model stays loaded on the Ollama server and holds its memory.
 - Cry alerts have been checked with a live microphone feed and a simulated detection, but not yet against a real cry. Expect to adjust `min_volume` and `threshold` for your room.
 - The critical alert switch has not been tried on a phone yet.
-- The listen page has been played in a desktop browser and found by name from a Mac. It has not been tried on a phone yet, including with the screen locked, and the sound runs a second or two behind the room.
+- The listen page has been played in a desktop browser and in Safari on an iPhone, and found by name from a Mac. It has not been tried with the phone's screen locked. The sound runs about six seconds behind the room, because each new listener is first sent the last six seconds so the player has something in reserve on a weak connection. `BACKLOG` at the top of `listen.py` sets that.
 - The tested model cannot make out a baby's eyes from an overhead camera, so a baby lying awake is read as asleep. A sleep can therefore start a few minutes early, and in practice a cry or an empty crib ends it. Rewording the prompt did not help on 27 hand-labeled frames. A sharper vision model or a closer camera probably would.
