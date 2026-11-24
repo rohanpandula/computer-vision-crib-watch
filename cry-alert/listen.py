@@ -5,6 +5,7 @@ It relays the sound that the cry-alert container already receives, and nothing e
 and none of that container's other controls. There is no login. Run `listen.py --selftest`
 to check the logic.
 """
+import collections
 import http.client
 import os
 import socket
@@ -21,6 +22,8 @@ SOURCE = os.environ.get("LISTEN_SOURCE", "http://127.0.0.1:1984/api/stream.aac?s
 IP = os.environ.get("LISTEN_IP", "")            # address to advertise; found automatically if empty
 MAX_LISTENERS = 8
 RETRY = 2                                       # seconds between tries when the camera's sound drops
+BACKLOG = 6     # seconds of sound a new listener gets at once. The player keeps it in reserve, so short
+                # network gaps (a phone on mobile data or a VPN) do not stop it. Sound is this far behind live.
 MDNS = ("224.0.0.251", 5353)
 TTL = 120
 SERVICE = "_http._tcp.local"
@@ -38,8 +41,9 @@ function play(){clearTimeout(timer);a.src="/stream.aac?"+Date.now();a.play().cat
 function retry(){if(!on)return;s.textContent="Reconnecting";clearTimeout(timer);timer=setTimeout(play,2000)}
 b.onclick=()=>{on=!on;b.textContent=on?"Stop":"Listen";
   if(on){s.textContent="Connecting";play()}else{clearTimeout(timer);a.pause();a.removeAttribute("src");a.load();s.textContent="Stopped"}};
-a.onplaying=()=>{if(on)s.textContent="Live"};
-a.onwaiting=()=>{if(on)s.textContent="Waiting for sound"};
+a.onplaying=()=>{if(on){clearTimeout(timer);s.textContent="Live"}};
+// out of sound: give the connection 5 seconds, then open a new one instead of waiting on a dead one
+a.onwaiting=()=>{if(on){s.textContent="Waiting for sound";clearTimeout(timer);timer=setTimeout(play,5000)}};
 a.onerror=a.onended=retry;
 // lock screen and control centre: a title, and play and pause buttons that work without unlocking
 if("mediaSession" in navigator){
@@ -50,6 +54,44 @@ if("mediaSession" in navigator){
 </script></html>""".encode()
 
 slots = threading.BoundedSemaphore(MAX_LISTENERS)
+recent = collections.deque()                    # (when, one whole audio frame) for the last BACKLOG seconds
+fresh = threading.Condition()
+count = 0                                       # frames received so far
+
+
+def frames(read):
+    """Cut ADTS AAC into whole frames, so a listener can start at any of them."""
+    buf = b""
+    while chunk := read(4096):
+        buf += chunk
+        while len(buf) >= 7:
+            size = ((buf[3] & 3) << 11) | (buf[4] << 3) | (buf[5] >> 5)
+            if buf[0] != 0xFF or buf[1] & 0xF6 != 0xF0 or size < 7:
+                buf = buf[1:]                       # not the start of a frame: look one byte on
+            elif len(buf) < size:
+                break
+            else:
+                yield buf[:size]
+                buf = buf[size:]
+
+
+def pump():
+    """Read the camera's sound for good, into `recent`. One reader, however many listeners."""
+    global count
+    while True:
+        try:
+            with urllib.request.urlopen(SOURCE, timeout=10) as up:
+                for frame in frames(up.read1):
+                    with fresh:
+                        now = time.monotonic()
+                        recent.append((now, frame))
+                        count += 1
+                        while now - recent[0][0] > BACKLOG:
+                            recent.popleft()
+                        fresh.notify_all()
+        except (OSError, http.client.HTTPException):
+            pass
+        time.sleep(RETRY)
 
 
 def keepalive(sock):
@@ -84,34 +126,32 @@ class Handler(BaseHTTPRequestHandler):
     def stream(self):
         if not slots.acquire(blocking=False):
             return self.send_error(503, "Too many listeners")
-        keepalive(self.connection)
-        started = False
+        t0, sent, why = time.time(), 0, "no audio from the camera"
         try:
+            with fresh:
+                if not recent or time.monotonic() - recent[-1][0] > 10:
+                    return self.send_error(502, "No audio from the camera")
+                todo, seen = [f for _, f in recent], count
+            keepalive(self.connection)
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/aac")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.connection.settimeout(15)          # a listener that stops reading is dropped
             while True:
-                try:
-                    with urllib.request.urlopen(SOURCE, timeout=10) as up:
-                        if not started:
-                            started = True                      # from here on, never a second reply
-                            self.send_response(200)
-                            self.send_header("Content-Type", "audio/aac")
-                            self.send_header("Cache-Control", "no-store")
-                            self.send_header("Connection", "close")
-                            self.end_headers()
-                            self.connection.settimeout(15)      # a listener that stops reading is dropped
-                        while chunk := up.read1(4096):
-                            try:
-                                self.wfile.write(chunk)
-                            except OSError:
-                                return                          # the listener left
-                except (OSError, http.client.HTTPException):
-                    if not started:
-                        return self.send_error(502, "No audio from the camera")
-                # The camera's sound dropped. Keep this listener and reconnect, because a locked
-                # phone cannot reconnect by itself. A listener that left is noticed on the next write.
-                time.sleep(RETRY)
-        except OSError:
-            pass
+                # If the camera's sound drops, this waits and carries on when it is back, because a
+                # locked phone cannot reconnect by itself. A listener that left is noticed on a write.
+                data = b"".join(todo)
+                self.wfile.write(data)
+                sent += len(data)
+                with fresh:
+                    fresh.wait_for(lambda: count > seen)
+                    todo, seen = [f for _, f in list(recent)[seen - count:]], count
+        except OSError as e:
+            why = f"listener gone ({e})"
         finally:
+            print(f"listen {self.client_address[0]}: ended after {time.time() - t0:.0f}s, {sent} bytes, {why}", flush=True)
             self.close_connection = True
             slots.release()
 
@@ -245,7 +285,15 @@ def selftest():
             hits.append(1)
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(b"\xff\xf1audio%d" % len(hits))
+            self.wfile.write(b"junk" + frame(b"audio%d" % len(hits)))
+
+    def frame(payload):                             # a real ADTS header, so the relay can find the frame
+        n = 7 + len(payload)
+        return bytes([0xFF, 0xF1, 0x50, 0x80 | n >> 11, n >> 3 & 0xFF, (n & 7) << 5 | 0x1F, 0xFC]) + payload
+
+    two = frame(b"one") + frame(b"two!")
+    parts = iter([two[:5], two[5:12], two[12:], b""])       # frames arrive cut anywhere
+    assert list(frames(lambda n: next(parts))) == [frame(b"one"), frame(b"two!")]
 
     hits = []
     up = ThreadingHTTPServer(("127.0.0.1", 0), Fake)
@@ -262,9 +310,13 @@ def selftest():
         except urllib.error.HTTPError as e:
             return e.code, b""
 
+    assert get("/stream.aac")[0] == 502                                    # nothing heard from the camera yet
     globals()["RETRY"] = 0.05
-    with urllib.request.urlopen(base + "/stream.aac", timeout=5) as r:      # the fake camera hangs up after
-        assert r.read(16) == b"\xff\xf1audio1\xff\xf1audio2"                 # each reply: the relay reconnects
+    threading.Thread(target=pump, daemon=True).start()
+    time.sleep(0.5)
+    with urllib.request.urlopen(base + "/stream.aac", timeout=5) as r:      # the fake camera hangs up after each
+        assert r.read(26) == frame(b"audio1") + frame(b"audio2")            # reply: a listener gets the backlog,
+        assert r.read(13) == frame(b"audio3")                               # in order, and the relay reconnects
     assert get("/")[1] == PAGE
     assert get("/api/streams")[0] == 404 and get("/stream.aac/../api")[0] == 404
     for _ in range(MAX_LISTENERS):
@@ -274,6 +326,8 @@ def selftest():
         slots.release()
     up.shutdown()
     globals()["SOURCE"] = "http://127.0.0.1:1/"
+    with fresh:
+        recent.clear()
     assert get("/stream.aac")[0] == 502
     print("selftest ok")
 
@@ -287,6 +341,7 @@ if __name__ == "__main__":
     if web and mdns:
         threading.Thread(target=bonjour, daemon=True).start()
     if web:
+        threading.Thread(target=pump, daemon=True).start()
         ThreadingHTTPServer(("", PORT), Handler).serve_forever()
     elif mdns:
         bonjour()
